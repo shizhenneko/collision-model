@@ -33,22 +33,26 @@
 
 ### 2.1 Vision Head (视觉感知层)
 *   **数据标注**: **无需人工标注**。网络通过端到端训练，自动学习图像中对避障有用的特征。
-*   **模型选型**: 推荐 **MobileNetV3-Small** 或 **ResNet-18**。
-    *   *ViT 分析*: Vision Transformer (ViT) 计算量大且需海量数据，不适合无 GPU 的 CPU 实时推理。MobileNet 专为 CPU 优化，速度更快。
+*   **模型选型**: 首选 **ShuffleNetV2 0.5x** (针对 Yeahbot/ARM CPU 极致优化)。
+    *   **备选**: **MobileNetV3-Small**。
+    *   *选型分析*: 鉴于 Yeahbot 的弱 CPU 性能，ShuffleNetV2 0.5x 在 ARM 架构上通常比 MobileNetV3 快 20% 以上。**ResNet-18** 计算量过大，予以弃用。
 *   **训练策略**: 使用 **ImageNet 预训练权重** (Transfer Learning) 初始化 Backbone，冻结浅层，仅微调深层，以适应小规模数据集。
 *   **输入/输出**: RGB 图像 (Resize至160x120) -> CNN -> 256/512维特征向量。
 
 ### 2.2 Lidar Head (激光感知层)
 *   **数据标注**: **无需人工标注**。直接使用原始距离数据。
 *   **模型选型**: **1D Convolution (一维卷积)**。
-    *   利用卷积核提取局部几何特征（如墙角、障碍物边缘）。
-    *   结构: `Conv1d(k=5) -> MaxPool -> Conv1d(k=3) -> Flatten`。
+    *   **关键技术**: 必须使用 **Circular Padding (环形填充)**。
+        *   *原因*: 激光雷达 360 度数据首尾相接 ($0^\circ$ 与 $359^\circ$ 相邻)。普通 Padding 会导致边界断裂，Circular Padding 保证了全方位的几何特征连续性。
+    *   结构: `Conv1d(k=5, padding_mode='circular') -> MaxPool -> ... -> Flatten`。
 *   **输入/输出**: 360维归一化距离数组 -> 1D CNN -> 128维特征向量。
 
 ### 2.3 IMU Head (惯性感知层)
 *   **数据标注**: **无需人工标注**。
-*   **模型选型**: **MLP (多层感知机)**。
-*   **输入/输出**: 9维运动状态向量 -> MLP -> 64维特征向量。
+*   **模型选型**: **Time Window + MLP**。
+    *   *改进*: 单帧数据难以区分“正常减速”与“碰撞急停”。采用 **时间窗口 (Time Window)** 输入，捕捉动态趋势。
+    *   **架构**: 取过去 $N$ 帧 (e.g., 0.5秒内 10 帧) 数据 -> **Flatten** -> **MLP**。相比 LSTM，Flatten+MLP 在弱 CPU 上推理速度最快。
+*   **输入/输出**: $10 \times 9$ 维时序矩阵 -> Flatten -> MLP -> 64维特征向量。
 
 ### 2.4 Fusion Layer (多模态融合层)
 *   **融合策略**: **Concatenation (拼接)**。
@@ -80,9 +84,12 @@
     *   **Step 2**: 训练 **VOA 策略网络**，基于 MSE Loss 学习专家的驾驶动作。
 
 ### 第三阶段：模型部署与本地推理 (Onboard Deployment)
-1.  **Model Export (WSL2)**: 将训练好的模型导出。为了适应 CPU 推理，建议转换为 ONNX 格式或使用 PyTorch Quantization 进行量化加速。
-2.  **Inference Node (VMware)**: 编写 ROS 推理节点，在本地运行。
-    *   加载模型文件 (如 `.onnx` 或 `.pth`)。
+1.  **Model Export (WSL2)**: **强制转换为 ONNX 格式**。
+    *   PyTorch 原生推理在树莓派级别 CPU 上效率极低。
+    *   必须使用 `torch.onnx.export` 将模型导出为标准 `.onnx` 文件。
+2.  **Inference Node (VMware)**: 编写基于 **ONNX Runtime** 的 ROS 推理节点。
+    *   **引擎**: 使用 `onnxruntime` (C++ 或 Python API) 进行推理，利用其 Graph Optimization 加速。
+    *   加载模型文件 (`model.onnx`)。
     *   实时处理传感器数据并输入模型。
     *   直接发布控制指令到 `/cmd_vel`。
 3.  **Safety Shield**: 在 VMware 端集成最终保护逻辑（如 ANN 预测高风险或 Lidar 检测极近障碍物时，无视网络指令强制刹车），保障系统安全。
