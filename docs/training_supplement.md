@@ -10,7 +10,7 @@
 这是机器人的“大脑”，负责驾驶。
 
 *   **功能**: 建立从“感知状态”到“运动指令”的映射。
-    *   **Input**: 多模态融合特征向量 (State Embedding, 448维)。
+    *   **Input**: 经 **Gated Fusion 加权**的多模态融合特征向量 (State Embedding, 448维)。门控模块会根据环境自动抑制噪声模态（如暗光下的视觉）。
     *   **Output**: 动作向量 $\mathbf{a} = [v, \omega]$ (线速度, 角速度)。
 *   **训练方法**: **行为克隆 (Behavior Cloning, BC)**。
     *   **本质**: 监督回归 (Supervised Regression)。
@@ -25,7 +25,7 @@
 这是机器人的“直觉”，负责评估风险。
 
 *   **功能**: 建立从“感知状态”到“碰撞概率”的映射。
-    *   **Input**: 多模态融合特征向量 (State Embedding, 448维)。
+    *   **Input**: 经 **Gated Fusion 加权**的多模态融合特征向量 (State Embedding, 448维)。
     *   **Output**: 标量概率 $P_{crash} \in [0, 1]$。
 *   **训练方法**: **二元分类 (Binary Classification)**。
     *   **本质**: 监督分类。

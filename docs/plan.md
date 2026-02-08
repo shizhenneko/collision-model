@@ -55,10 +55,14 @@
 *   **输入/输出**: $10 \times 9$ 维时序矩阵 -> Flatten -> MLP -> 64维特征向量。
 
 ### 2.4 Fusion Layer (多模态融合层)
-*   **融合策略**: **Concatenation (拼接)**。
-    *   $F_{fused} = Concat([F_{vision}, F_{lidar}, F_{imu}])$。
-    *   总维度: $256 + 128 + 64 = 448$。
-*   **特征交互**: 拼接后通过 1-2 层全连接层 (`Linear -> ReLU`)，生成最终的状态编码 (State Embedding)。
+*   **融合策略**: **Gated Fusion (门控融合)**。
+    *   **核心机制**: 引入轻量级 **Gate Module (注意力门控)**，动态评估各模态的可靠性。
+    *   **计算流程**:
+        1.  拼接原始特征: $F_{raw} = Concat([F_{vision}, F_{lidar}, F_{imu}])$。
+        2.  生成权重: $W = Sigmoid(MLP(F_{raw})) \in [0, 1]^3$ (分别为 $w_{vis}, w_{lid}, w_{imu}$)。
+        3.  加权融合: $F_{fused} = Concat([w_{vis} \cdot F_{vis}, w_{lid} \cdot F_{lid}, w_{imu} \cdot F_{imu}])$。
+*   **总维度**: $256 + 128 + 64 = 448$ (保持不变，但特征经过了加权筛选)。
+*   **设计优势**: 极大提升鲁棒性。例如在**黑暗环境**下，网络会自动学习到 $w_{vis} \approx 0$，从而忽略视觉噪声，完全依赖雷达和 IMU 进行决策。
 
 ### 2.5 任务头与训练目标 (Task Heads & Labels)
 
