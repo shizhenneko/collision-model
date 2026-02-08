@@ -17,7 +17,6 @@ Description:
 """
 
 import rospy
-import message_filters
 import cv2
 import csv
 import os
@@ -44,6 +43,7 @@ class DataCollector:
         self.latest_cmd_vel = Twist()
         self.cmd_vel_timestamp = rospy.Time(0)
         self.recording = True
+        self.frame_count = 0
         
         # --- Setup Output Directory ---
         timestamp_str = time.strftime("%Y%m%d_%H%M%S")
@@ -68,25 +68,28 @@ class DataCollector:
         # 1. Asynchronous Cmd_vel (Control Input)
         self.sub_cmd = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_cb)
         
-        # 2. Synchronized Sensors
-        # Note: Adjust topics if necessary (e.g. /camera/image_raw vs /usb_cam/image_raw)
-        self.sub_image = message_filters.Subscriber('/usb_cam/image_raw', Image)
-        self.sub_scan = message_filters.Subscriber('/scan', LaserScan)
-        self.sub_imu = message_filters.Subscriber('/imu', Imu)
+        # 2. Independent Sensors (Fallback Mode)
+        self.latest_scan = None
+        self.latest_imu = None
         
-        # ApproximateTimeSynchronizer: allows for slight time differences
-        # queue_size=10, slop=0.1s (100ms tolerance)
-        self.sync = message_filters.ApproximateTimeSynchronizer(
-            [self.sub_image, self.sub_scan, self.sub_imu], 
-            queue_size=10, 
-            slop=0.1
-        )
-        self.sync.registerCallback(self.sync_cb)
+        self.sub_scan = rospy.Subscriber('/scan', LaserScan, self.scan_cb)
+        self.sub_imu = rospy.Subscriber('/imu', Imu, self.imu_cb)
+        
+        # 3. Main Trigger (Camera)
+        self.sub_image = rospy.Subscriber('/usb_cam/image_raw', Image, self.image_cb)
         
     def cmd_vel_cb(self, msg):
         """Cache the latest control command."""
         self.latest_cmd_vel = msg
         self.cmd_vel_timestamp = rospy.Time.now()
+
+    def scan_cb(self, msg):
+        """Cache latest Lidar scan."""
+        self.latest_scan = msg
+
+    def imu_cb(self, msg):
+        """Cache latest IMU data."""
+        self.latest_imu = msg
 
     def process_image(self, msg):
         """Convert ROS Image to resized OpenCV image."""
@@ -145,9 +148,14 @@ class DataCollector:
         # Combine into 9-dim vector
         return [ax, ay, az, wx, wy, wz, roll, pitch, yaw]
 
-    def sync_cb(self, image_msg, scan_msg, imu_msg):
-        """Main callback for synchronized data."""
+    def image_cb(self, image_msg):
+        """Main trigger callback (Fallback/Async Mode)."""
         if not self.recording:
+            return
+
+        # Fallback Check: Do we have other sensor data?
+        if self.latest_scan is None or self.latest_imu is None:
+            # Wait for initialization
             return
 
         # Use image timestamp as the primary key
@@ -165,11 +173,11 @@ class DataCollector:
         img_path_abs = os.path.join(self.image_dir, img_filename)
         cv2.imwrite(img_path_abs, processed_img)
         
-        # 2. Process Lidar
-        lidar_data = self.process_lidar(scan_msg)
+        # 2. Process Lidar (Use Cached)
+        lidar_data = self.process_lidar(self.latest_scan)
         
-        # 3. Process IMU
-        imu_data = self.process_imu(imu_msg)
+        # 3. Process IMU (Use Cached)
+        imu_data = self.process_imu(self.latest_imu)
         
         # 4. Get latest Cmd_vel
         # Optional: check if cmd_vel is stale (e.g. > 0.5s old)
@@ -189,7 +197,8 @@ class DataCollector:
         ])
         
         # Log periodically
-        if timestamp.seq % 100 == 0:  # Assuming seq is populated, or just use counter
+        self.frame_count += 1
+        if self.frame_count % 100 == 0:
             rospy.loginfo(f"Recorded frame at {timestamp.to_sec():.2f}")
 
     def shutdown(self):
