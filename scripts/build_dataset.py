@@ -60,8 +60,8 @@ def parse_args():
                         help="Lidar distance threshold for collision label")
     
     # Cleaning Params
-    parser.add_argument('--min_lin_vel', type=float, default=0.03, help="Min linear velocity")
-    parser.add_argument('--min_ang_vel', type=float, default=0.03, help="Min angular velocity")
+    parser.add_argument('--min_lin_vel', type=float, default=0.02, help="Min linear velocity")
+    parser.add_argument('--min_ang_vel', type=float, default=0.02, help="Min angular velocity")
     parser.add_argument('--filter_floor', action='store_true', help="Enable floor-only filtering")
     parser.add_argument('--floor_threshold', type=float, default=0.7, help="Floor detection threshold")
     
