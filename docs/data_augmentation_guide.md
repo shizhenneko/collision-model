@@ -195,6 +195,107 @@ def filter_stationary_data(df, min_lin_vel=0.01, min_ang_vel=0.01):
 
 ---
 
+## 多时间尺度VOA数据准备 (Multi-Time Scale VOA Data Preparation)
+
+### 核心目标
+
+为VOA多时间尺度策略网络准备训练数据，使其能够预测未来多个时间点的动作序列，支持ANN强制停止后的动作续接。
+
+### 多时间尺度动作标签生成
+
+```python
+def generate_multi_scale_action_labels(df, time_scales=[0.1, 0.5, 1.0], fps=20):
+    """
+    生成多时间尺度动作标签
+    
+    物理意义：
+    - 基于专家遥控指令序列，提取未来多个时间点的动作
+    - 短期(0.1s): 应对即时环境变化
+    - 中期(0.5s): 覆盖ANN制动周期
+    - 长期(1.0s): 规划危险解除后的恢复动作
+    
+    Args:
+        df: DataFrame包含cmd_vel数据 (linear_x, angular_z)
+        time_scales: 时间尺度列表 [短期, 中期, 长期] (秒)
+        fps: 数据采集帧率 (默认20fps)
+        
+    Returns:
+        multi_scale_actions: dict, 各时间尺度的动作标签
+            {
+                'short': [[v_01, w_01], ...],    # 0.1秒后的动作
+                'medium': [[v_05, w_05], ...],   # 0.5秒后的动作  
+                'long': [[v_10, w_10], ...]      # 1.0秒后的动作
+            }
+    """
+    n_samples = len(df)
+    multi_scale_actions = {
+        'short': np.zeros((n_samples, 2)),
+        'medium': np.zeros((n_samples, 2)),
+        'long': np.zeros((n_samples, 2))
+    }
+    
+    # 将时间尺度转换为帧数
+    frame_scales = [int(scale * fps) for scale in time_scales]
+    
+    for t in range(n_samples):
+        for i, (scale_name, frame_offset) in enumerate(zip(['short', 'medium', 'long'], frame_scales)):
+            future_idx = min(t + frame_offset, n_samples - 1)
+            
+            # 提取未来时间点的动作
+            future_v = df.iloc[future_idx]['linear_x']
+            future_w = df.iloc[future_idx]['angular_z']
+            
+            multi_scale_actions[scale_name][t] = [future_v, future_w]
+    
+    return multi_scale_actions
+
+# 使用示例
+multi_scale_voa_labels = generate_multi_scale_action_labels(cleaned_df)
+print(f"多尺度动作标签生成完成:")
+print(f"短期尺度(0.1s): {multi_scale_voa_labels['short'].shape}")
+print(f"中期尺度(0.5s): {multi_scale_voa_labels['medium'].shape}")
+print(f"长期尺度(1.0s): {multi_scale_voa_labels['long'].shape}")
+```
+
+### 多时间尺度数据增强策略
+
+```python
+def augment_multimodal_sample_multi_scale(sample, multi_scale_actions):
+    """
+    多模态协同增强（支持多时间尺度）
+    
+    核心原则：
+    - 多个传感器感知同一场景
+    - 增强必须同步，否则传感器数据错配
+    - 所有时间尺度的动作标签必须同步增强
+    """
+    augmented = sample.copy()
+    augmented_actions = multi_scale_actions.copy()
+    
+    # 图像左右翻转
+    if random.random() < 0.5:
+        # 1. 图像翻转
+        augmented['image'] = cv2.flip(augmented['image'], 1)
+        
+        # 2. 同步翻转Lidar（必须！）
+        augmented['lidar'] = np.flip(augmented['lidar'])
+        
+        # 3. 同步调整所有时间尺度的角速度方向
+        for scale in ['short', 'medium', 'long']:
+            augmented_actions[scale][1] = -augmented_actions[scale][1]  # w取反
+    
+    # Lidar环形平移（不影响动作，因为动作是全局的）
+    if random.random() < 0.5:
+        shift = random.randint(0, 360)
+        augmented['lidar'] = np.roll(augmented['lidar'], shift)
+    
+    # 添加传感器噪声
+    augmented['lidar'] += np.random.normal(0, 0.02, 360)
+    augmented['imu'] += np.random.normal(0, 0.001, 9)
+    
+    return augmented, augmented_actions
+```
+
 ## 自动标签生成
 
 ### 原理
@@ -208,67 +309,85 @@ ANN Collision Model是**二元分类任务**，需要明确的标签：
 ### 实现方法
 
 ```python
-def generate_auto_labels(df, future_window=10, collision_threshold=0.2):
+def generate_auto_labels(df, future_window=10, collision_threshold=0.2, multi_scale_windows=[2, 10, 20]):
     """
-    自动生成碰撞标签
+    自动生成碰撞标签（支持多时间尺度）
 
     物理意义：
     - 检查未来T秒（10帧≈0.5秒）内，Lidar最小距离
     - 如果存在距离 < 0.2m 的障碍物，标记为危险 (y=1)
     - 否则标记为安全 (y=0)
+    - 支持多时间尺度预测，为VOA多尺度训练提供标签
 
     Args:
         df: DataFrame包含lidar_ranges列
-        future_window: 未来检查的帧数
+        future_window: 未来检查的帧数（默认10帧≈0.5秒）
         collision_threshold: 碰撞距离阈值 (m)
+        multi_scale_windows: 多时间尺度窗口 [短期, 中期, 长期] 帧数
 
     Returns:
         labels: numpy数组，形状为[n_samples,]，值为0或1
+        multi_scale_labels: dict, 各时间尺度的碰撞标签 {short: [...], medium: [...], long: [...]}
     """
     n_samples = len(df)
     labels = np.zeros(n_samples, dtype=int)
+    multi_scale_labels = {
+        'short': np.zeros(n_samples, dtype=int),    # 短期: 2帧≈0.1秒
+        'medium': np.zeros(n_samples, dtype=int),  # 中期: 10帧≈0.5秒  
+        'long': np.zeros(n_samples, dtype=int)       # 长期: 20帧≈1.0秒
+    }
 
     for t in range(n_samples):
-        # 获取未来T帧的Lidar数据
+        # 标准单尺度标签生成
         end_idx = min(t + future_window, n_samples)
         future_lidars = df.iloc[t:end_idx]['lidar_ranges']
+        
+        # 多时间尺度标签生成
+        for scale, window in zip(['short', 'medium', 'long'], multi_scale_windows):
+            scale_end_idx = min(t + window, n_samples)
+            scale_future_lidars = df.iloc[t:scale_end_idx]['lidar_ranges']
+            
+            # 计算该时间尺度下的最小距离
+            min_distance = float('inf')
+            for lidar in scale_future_lidars:
+                if isinstance(lidar, str):
+                    lidar = ast.literal_eval(lidar)
+                valid_ranges = [r for r in lidar if r < 8.0]
+                if valid_ranges:
+                    min_dist_in_frame = min(valid_ranges)
+                    min_distance = min(min_distance, min_dist_in_frame)
+            
+            # 生成该时间尺度的标签
+            if min_distance < collision_threshold:
+                multi_scale_labels[scale][t] = 1  # 危险
+            else:
+                multi_scale_labels[scale][t] = 0  # 安全
+        
+        # 标准标签使用中期尺度
+        labels = multi_scale_labels['medium']
 
-        # 找出未来T帧内，Lidar检测到的最小距离
-        min_distance = float('inf')
-
-        for lidar in future_lidars:
-            # 解析Lidar数据（如果是字符串格式）
-            if isinstance(lidar, str):
-                lidar = ast.literal_eval(lidar)
-
-            # 找到当前帧的最小距离（忽略无穷大值）
-            valid_ranges = [r for r in lidar if r < 8.0]
-            if valid_ranges:
-                min_dist_in_frame = min(valid_ranges)
-                min_distance = min(min_distance, min_dist_in_frame)
-
-        # 生成标签
-        if min_distance < collision_threshold:
-            labels[t] = 1  # 危险
-        else:
-            labels[t] = 0  # 安全
-
-    return labels
+    return labels, multi_scale_labels
 ```
 
 ### 直观理解
 
 ```
 时间轴示例：
-t=0s     t=0.05s   t=0.1s    t=0.5s
-|--------|----------|---------|--------|
-  Lidar   Lidar     Lidar    Lidar
-  [3.0,   [2.5,     [1.0,    [0.1,   ← 0.1m < 0.2m，危险！
-   2.5...] 2.0...]   0.5...]   0.2...]
+t=0s     t=0.05s   t=0.1s    t=0.5s    t=1.0s
+|--------|----------|---------|---------|--------|
+  Lidar   Lidar     Lidar    Lidar     Lidar
+  [3.0,   [2.5,     [1.0,    [0.1,     [2.0,   ← 多时间尺度检测
+   2.5...] 2.0...]   0.5...]   0.2...]   1.5...]
 
-自动标签生成：
-- 对t=0s的数据：检查未来0.5s内Lidar，发现最小距离=0.1m < 0.2m
-- 结论：标签y=1（危险）
+多时间尺度标签生成：
+- 短期尺度(t+0.1s): 检查2帧内Lidar，最小距离=1.0m > 0.2m → y=0（安全）
+- 中期尺度(t+0.5s): 检查10帧内Lidar，最小距离=0.1m < 0.2m → y=1（危险）
+- 长期尺度(t+1.0s): 检查20帧内Lidar，最小距离=0.1m < 0.2m → y=1（危险）
+
+应用场景：
+- ANN正常检测：使用中期尺度标签训练
+- VOA多尺度预测：使用各尺度标签分别训练不同时间视野的动作预测
+- 动作续接：根据ANN制动时长选择合适尺度的VOA预测动作
 ```
 
 ---
@@ -634,7 +753,7 @@ class RewardWeightedVOATrainer:
             weight = torch.exp(torch.tensor(R / self.T))
 
             # 5. 奖励加权（关键步骤）
-！            weighted_loss = weight * mse_loss
+            weighted_loss = weight * mse_loss
 
             # 6. 反向传播
             self.optimizer.zero_grad()
@@ -656,6 +775,80 @@ class RewardWeightedVOATrainer:
 
             if epoch % 10 == 0:
                 print(f"VOA Epoch {epoch}, Loss: {loss:.4f}")
+
+        return self.voa_model
+
+
+class MultiScaleVOATrainer:
+    def __init__(self, voa_model, T=1.0, scale_weights=[1.0, 1.0, 0.8]):
+        """
+        多时间尺度VOA训练器
+        
+        Args:
+            voa_model: 多时间尺度VOA策略网络
+            T: 温度参数，控制奖励权重尖锐程度
+            scale_weights: 各时间尺度的损失权重 [短期, 中期, 长期]
+        """
+        self.voa_model = voa_model
+        self.T = T
+        self.scale_weights = scale_weights
+        self.optimizer = torch.optim.Adam(voa_model.parameters(), lr=0.0001)
+        self.mse_criterion = nn.MSELoss()
+
+    def train_epoch(self, dataset, rewards):
+        """
+        训练多时间尺度VOA策略网络
+        
+        核心公式：
+            Loss = exp(R / T) * sum(alpha_i * MSE(a_pred_i, a_expert_i))
+        """
+        total_loss = 0.0
+
+        for batch in dataset:
+            # 1. 前向传播VOA多尺度网络
+            state = batch['state']
+            multi_scale_actions_pred = self.voa_model(state)  # [batch_size, 6]
+
+            # 2. 获取专家多尺度动作 [short, medium, long]
+            expert_actions = batch['multi_scale_actions']  # [batch_size, 6]
+
+            # 3. 计算多尺度MSE Loss
+            multi_scale_loss = 0.0
+            for i, weight in enumerate(self.scale_weights):
+                start_idx = i * 2
+                end_idx = (i + 1) * 2
+                pred_action = multi_scale_actions_pred[:, start_idx:end_idx]
+                expert_action = expert_actions[:, start_idx:end_idx]
+                scale_loss = self.mse_criterion(pred_action, expert_action)
+                multi_scale_loss += weight * scale_loss
+
+            # 4. 获取奖励权重
+            R = batch['reward']
+            weight = torch.exp(torch.tensor(R / self.T))
+
+            # 5. 奖励加权
+            weighted_loss = weight * multi_scale_loss
+
+            # 6. 反向传播
+            self.optimizer.zero_grad()
+            weighted_loss.backward()
+            self.optimizer.step()
+
+            total_loss += weighted_loss.item()
+
+        avg_loss = total_loss / len(dataset)
+
+        return avg_loss
+
+    def train(self, dataset, rewards, num_epochs=100):
+        """
+        完整训练循环
+        """
+        for epoch in range(num_epochs):
+            loss = self.train_epoch(dataset, rewards)
+
+            if epoch % 10 == 0:
+                print(f"Multi-Scale VOA Epoch {epoch}, Loss: {loss:.4f}")
 
         return self.voa_model
 ```
@@ -709,8 +902,46 @@ def main_rwr_pipeline():
     print("\n[Step 4] 用ANN打分（计算奖励权重）...")
     rewards = step4_ann_scoring(ann_model, augmented_dataset)
 
-    # ===== Step 5: 训练VOA Policy（加权Loss） =====
-    print("\n[Step 5] 训练VOA Policy（奖励加权回归）...")
+    # ===== Step 5: 训练VOA Multi-Time Scale Policy =====
+    print("\n[Step 5] 训练VOA多时间尺度策略网络...")
+    # 生成多时间尺度动作标签
+    multi_scale_actions = generate_multi_scale_action_labels(augmented_dataset)
+    
+    voa_multi_scale_model = VOAMultiScalePolicyNetwork()
+    voa_multi_scale_trainer = MultiScaleVOATrainer(voa_multi_scale_model, T=1.0)
+    
+    voa_multi_scale_dataset = prepare_voa_multi_scale_dataset(augmented_dataset, multi_scale_actions, rewards)
+    trained_voa_multi_scale = voa_multi_scale_trainer.train(voa_multi_scale_dataset, rewards, num_epochs=100)
+
+
+def prepare_voa_multi_scale_dataset(augmented_dataset, multi_scale_actions, rewards):
+    """
+    为多时间尺度VOA训练准备数据集
+    """
+    voa_multi_scale_samples = []
+    
+    for i, sample in enumerate(augmented_dataset):
+        # 构建多尺度动作标签 [v_short, w_short, v_medium, w_medium, v_long, w_long]
+        multi_scale_action = torch.tensor([
+            multi_scale_actions['short'][i][0],   # v_short
+            multi_scale_actions['short'][i][1],   # w_short
+            multi_scale_actions['medium'][i][0], # v_medium
+            multi_scale_actions['medium'][i][1], # w_medium
+            multi_scale_actions['long'][i][0],    # v_long
+            multi_scale_actions['long'][i][1]    # w_long
+        ], dtype=torch.float32)
+        
+        voa_sample = {
+            'state': extract_multimodal_features(sample),  # 提取多模态特征
+            'multi_scale_actions': multi_scale_action,
+            'reward': rewards[i]
+        }
+        voa_multi_scale_samples.append(voa_sample)
+    
+    return voa_multi_scale_samples
+    
+    # ===== Step 5.5: 训练VOA Single-Time Scale Policy =====
+    print("\n[Step 5.5] 训练VOA单时间尺度策略网络...")
     voa_model = VOAPolicyNetwork()
     voa_trainer = RewardWeightedVOATrainer(voa_model, T=1.0)
 
@@ -721,7 +952,8 @@ def main_rwr_pipeline():
     print("\n[Step 6] 保存模型...")
     torch.save(ann_model.state_dict(), 'models/ann_collision_model.pth')
     torch.save(trained_voa.state_dict(), 'models/voa_policy_model.pth')
-    print("模型已保存！")
+    torch.save(trained_voa_multi_scale.state_dict(), 'models/voa_multi_scale_policy_model.pth')
+    print("模型已保存！（包含多时间尺度VOA模型）")
 
     print("\n" + "=" * 60)
     print("训练完成！")

@@ -1,4 +1,9 @@
 .trae
-datas
-data_argument
-data_cleaned
+data*
+.venv
+analyze*
+data.csv
+images.zip
+interact.md
+test*
+src
