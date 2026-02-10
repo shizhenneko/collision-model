@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
+import torch.nn.functional as F
 
 def _activation(name):
     name = (name or 'silu').lower()
@@ -44,7 +45,8 @@ class ShuffleNetV2Ext(nn.Module):
         x = self.backbone.conv5(x) # [B, 1024, 4, 5] (approx)
         
         # Global Average Pooling
-        x = x.mean([2, 3]) # [B, 1024]
+        # 使用 AdaptiveAvgPool2d 替代 mean()，避免 ONNX 导出时的 ReduceMean 算子版本转换问题
+        x = F.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
         return x
 
 class VisionEncoder(nn.Module):
@@ -86,10 +88,15 @@ class VisionEncoder(nn.Module):
 class GlobalMaxPool1d(nn.Module):
     def __init__(self):
         super(GlobalMaxPool1d, self).__init__()
+        # 回归最原始的 torch.max 写法
+        # 在 Opset 14 中，ReduceMax 支持 axes 输入，完全兼容
 
     def forward(self, x):
         # x: [B, C, L] -> [B, C, 1]
-        return torch.max(x, dim=-1, keepdim=True)[0]
+        # 使用 MaxPool1d(kernel_size=45) 替代 torch.max()
+        # 避免 ONNX 导出时的 ReduceMax 算子版本转换问题
+        # LidarEncoder 经过3次 stride=2 的卷积，360 -> 180 -> 90 -> 45
+        return F.max_pool1d(x, kernel_size=45)
 
 class LidarEncoder(nn.Module):
     def __init__(self, output_dim=128, activation='silu', dropout=0.0):
@@ -127,7 +134,10 @@ class LidarEncoder(nn.Module):
     def forward(self, x):
         # x: [B, 360] -> [B, 1, 360]
         if x.dim() == 2:
-            x = x.unsqueeze(1)
+            # 使用 reshape 替代 unsqueeze(1)，解决 Opset 11 导出时
+            # axes 从 Input 转 Attribute 的 converter bug
+            # 这种修改是数学等价的，不需要重新训练
+            x = x.reshape(x.shape[0], 1, x.shape[1])
         feat = self.net(x)
         return self.fc(feat)
 

@@ -1,0 +1,15 @@
+<launch>
+  <!-- Inference Node -->
+  <node pkg="collision_model" type="inference_node.py" name="voa_inference_node" output="screen">
+    <!-- Remap topics to match your robot's configuration -->
+    <remap from="/camera/image_raw" to="/camera/rgb/image_raw"/>
+    <remap from="/scan" to="/scan"/>
+    <remap from="/imu/data" to="/imu/data"/>
+    <remap from="/cmd_vel" to="/cmd_vel"/>
+
+    <!-- Parameters -->
+    <param name="ann_model_path" value="$(find collision_model)/checkpoints/ann_model.onnx"/>
+    <param name="voa_model_path" value="$(find collision_model)/checkpoints/voa_model.onnx"/>
+    <param name="risk_threshold" value="0.7"/>
+  </node>
+</launch>

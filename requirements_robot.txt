@@ -1,0 +1,16 @@
+# 基础数值计算库 (适配 Python 3.8 / ROS Noetic)
+numpy>=1.21.0,<2.0.0
+
+# ONNX 推理引擎 (CPU版本)
+# 推荐 1.15.0+ 以获得更好的性能和对 Opset 18 的完整支持
+onnxruntime>=1.15.1
+
+# 计算机视觉库
+# 注意：ROS Noetic 自带 OpenCV (cv_bridge)。
+# 如果遇到 "ModuleNotFoundError: No module named 'cv2'" 再安装此项，
+# 否则建议优先使用 ROS 系统自带版本以避免库冲突。
+opencv-python>=4.6.0.66
+
+# ROS Python 工具 (通常 ROS 环境已预装)
+rospkg>=1.4.0
+PyYAML>=6.0

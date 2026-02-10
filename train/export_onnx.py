@@ -71,7 +71,7 @@ def export_model(model_class, checkpoint_path, output_path, is_dual_head=False, 
         (dummy_image, dummy_lidar, dummy_imu),
         output_path,
         export_params=True,        # 存储权重
-        opset_version=11,          # 通用版本
+        opset_version=18,          # 使用 Opset 18，避免 PyTorch 2.x 的降级转换错误
         do_constant_folding=True,  # 优化常量
         input_names=['image', 'lidar', 'imu'],
         output_names=output_names,
@@ -84,7 +84,7 @@ def export_model(model_class, checkpoint_path, output_path, is_dual_head=False, 
         import onnxruntime as ort
         import numpy as np
         
-        ort_session = ort.InferenceSession(output_path)
+        ort_session = ort.InferenceSession(output_path, providers=['CPUExecutionProvider'])
         
         ort_inputs = {
             'image': dummy_image.numpy(),
