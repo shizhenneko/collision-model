@@ -4,8 +4,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import threading
-import time
-from collections import deque
+import rospkg
 
 from sensor_msgs.msg import Image, LaserScan, Imu
 from geometry_msgs.msg import Twist
@@ -17,11 +16,18 @@ class InferenceNode:
     def __init__(self):
         rospy.init_node('voa_inference_node', anonymous=True)
         
-        # Resolve absolute paths based on script location
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(script_dir)
-        default_ann_path = os.path.join(project_root, 'checkpoints', 'ann_model.onnx')
-        default_voa_path = os.path.join(project_root, 'checkpoints', 'voa_model.onnx')
+        # Resolve absolute paths using rospkg for robustness
+        try:
+            rospack = rospkg.RosPack()
+            package_path = rospack.get_path('collision_model')
+            default_ann_path = os.path.join(package_path, 'checkpoints', 'ann_model.onnx')
+            default_voa_path = os.path.join(package_path, 'checkpoints', 'voa_model.onnx')
+        except Exception as e:
+            rospy.logwarn(f"Could not find package path via rospkg: {e}. Falling back to script relative path.")
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(script_dir)
+            default_ann_path = os.path.join(project_root, 'checkpoints', 'ann_model.onnx')
+            default_voa_path = os.path.join(project_root, 'checkpoints', 'voa_model.onnx')
         
         # Parameters
         self.ann_path = rospy.get_param('~ann_model_path', default_ann_path)
@@ -94,34 +100,36 @@ class InferenceNode:
         if msg is None:
             return np.zeros((1, 360), dtype=np.float32)
             
-        # Resample to 360 points
+        # 1. Handle Raw Data
         ranges = np.array(msg.ranges)
-        
-        # Handle Inf/NaN
+        # Replace Inf with Max Range, NaN with 0
         ranges = np.nan_to_num(ranges, posinf=8.0, neginf=0.0)
-        ranges = np.clip(ranges, 0.0, 8.0)
         
-        # Resample logic (Simple linear interpolation or nearest neighbor)
-        # Assuming Lidar is 360 degrees. If not, this needs adjustment based on actual robot hardware.
-        # For now, we assume the input size matches or we just resize.
-        # The training data used 360 points.
-        
+        # 2. Resample to 360 points (if needed) to match Training Data
         current_len = len(ranges)
         if current_len == 360:
             resampled = ranges
         else:
-            # Simple resampling
             x_old = np.linspace(0, 1, current_len)
             x_new = np.linspace(0, 1, 360)
             resampled = np.interp(x_new, x_old, ranges)
             
-        # Normalize by 8.0 (Max Range)
+        # 3. Clip values (Physical Constraints matching Training Data)
+        # Training data cleaner uses [0.05, 8.0]
+        resampled = np.clip(resampled, 0.05, 8.0)
+        
+        # 4. Spike Filter (Matching Training Data Cleaner)
+        # Remove single-point noise spikes
+        prev_lidar = np.roll(resampled, 1)
+        next_lidar = np.roll(resampled, -1)
+        
+        # If point differs > 0.5m from BOTH neighbors, replace with average
+        spike_mask = (np.abs(resampled - prev_lidar) > 0.5) & (np.abs(resampled - next_lidar) > 0.5)
+        resampled[spike_mask] = (prev_lidar[spike_mask] + next_lidar[spike_mask]) / 2.0
+        
+        # 5. Normalize
         resampled = resampled.astype(np.float32) / 8.0
         
-        # Add Batch/Channel Dims [1, 360] -> Model expects [1, 360] or [1, 1, 360]? 
-        # export_onnx.py: dummy_lidar = torch.randn(1, 360)
-        # But LidarEncoder expects [B, 1, 360] internally, but forward input is [B, 360] and it reshapes it.
-        # So we provide [1, 360]
         return np.expand_dims(resampled, axis=0)
 
     def preprocess_imu(self, msg):

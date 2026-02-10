@@ -71,13 +71,41 @@ def export_model(model_class, checkpoint_path, output_path, is_dual_head=False, 
         (dummy_image, dummy_lidar, dummy_imu),
         output_path,
         export_params=True,        # 存储权重
-        opset_version=18,          # 使用 Opset 18，避免 PyTorch 2.x 的降级转换错误
+        opset_version=9,           # User requested max IR version 9 (interpreting as opset_version=9)
         do_constant_folding=True,  # 优化常量
         input_names=['image', 'lidar', 'imu'],
         output_names=output_names,
         dynamic_axes=dynamic_axes
     )
     print(f"  Export success: {output_path}")
+    
+    # Post-processing: Merge external data and fix IR version
+    try:
+        import onnx
+        model_proto = onnx.load(output_path)
+        modified = False
+        
+        # 1. Downgrade IR version if needed (Fix for "Unsupported model IR version: 10")
+        # Target device supports max IR version 9.
+        if model_proto.ir_version > 9:
+            print(f"  Downgrading IR version from {model_proto.ir_version} to 9...")
+            model_proto.ir_version = 9
+            modified = True
+
+        # 2. Merge external data
+        if os.path.exists(output_path + ".data"):
+            print("  Detected external data file. Attempting to merge into single .onnx file...")
+            # Loading and saving automatically merges if size is small
+            modified = True
+            
+        if modified:
+            onnx.save(model_proto, output_path)
+            print("  Model post-processing (IR fix / merge) completed.")
+        
+    except ImportError:
+        print("  Warning: 'onnx' library not found. Skipping post-processing.")
+    except Exception as e:
+        print(f"  Warning: Failed to post-process ONNX model: {e}")
     
     # 5. 验证 ONNX 模型 (Optional)
     try:
@@ -117,7 +145,8 @@ def main():
         model_kwargs={
             'action_output_mode': 'tanh_scaled',
             'action_v_max': ACTION_V_MAX,
-            'action_w_max': ACTION_W_MAX
+            'action_w_max': ACTION_W_MAX,
+            'activation': 'relu'
         }
     )
     
@@ -127,7 +156,10 @@ def main():
         os.path.join(save_dir, 'ann_best.pth'), 
         os.path.join(save_dir, 'ann_model.onnx'),
         is_dual_head=False,
-        wrap_single_head_sigmoid=True
+        wrap_single_head_sigmoid=True,
+        model_kwargs={
+            'activation': 'relu'
+        }
     )
 
 if __name__ == '__main__':

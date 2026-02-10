@@ -6,6 +6,7 @@ import onnxruntime as ort
 import threading
 import math
 import tf.transformations
+import rospkg
 
 from sensor_msgs.msg import Image, LaserScan, Imu
 from geometry_msgs.msg import Twist, PoseStamped
@@ -18,11 +19,18 @@ class NavigationNode:
     def __init__(self):
         rospy.init_node('navigation_node', anonymous=True)
         
-        # Resolve absolute paths based on script location
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(script_dir)
-        default_ann_path = os.path.join(project_root, 'checkpoints', 'ann_model.onnx')
-        default_voa_path = os.path.join(project_root, 'checkpoints', 'voa_model.onnx')
+        # Resolve absolute paths using rospkg for robustness
+        try:
+            rospack = rospkg.RosPack()
+            package_path = rospack.get_path('collision_model')
+            default_ann_path = os.path.join(package_path, 'checkpoints', 'ann_model.onnx')
+            default_voa_path = os.path.join(package_path, 'checkpoints', 'voa_model.onnx')
+        except Exception as e:
+            rospy.logwarn(f"Could not find package path via rospkg: {e}. Falling back to script relative path.")
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(script_dir)
+            default_ann_path = os.path.join(project_root, 'checkpoints', 'ann_model.onnx')
+            default_voa_path = os.path.join(project_root, 'checkpoints', 'voa_model.onnx')
         
         # Parameters
         self.ann_path = rospy.get_param('~ann_model_path', default_ann_path)
@@ -51,6 +59,18 @@ class NavigationNode:
         self.is_braking = False
         self.brake_start_time = None
         self.nav_state = "IDLE" # IDLE, NAVIGATING, REACHED
+
+        # Avoidance Persistence (Anti-Oscillation)
+        self.last_avoidance_time = rospy.Time.now()
+        self.avoidance_cooldown = 2.0 # Seconds to suppress Nav after VOA action
+        
+        # Stuck Detection
+        self.stuck_check_interval = 2.0
+        self.last_stuck_check_time = rospy.Time.now()
+        self.last_pose_position = None
+        self.stuck_distance_threshold = 0.1 # m
+        self.is_recovering = False
+        self.recovery_start_time = None
         
         # Publishers
         self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
@@ -80,7 +100,32 @@ class NavigationNode:
         with self.lock:
             self.current_goal = msg.pose
             self.nav_state = "NAVIGATING"
+            self.is_recovering = False # Reset recovery
             rospy.loginfo("New Goal Received!")
+
+    def check_if_stuck(self, cmd_v, cmd_w):
+        # Only check if we are trying to move
+        if abs(cmd_v) < 0.05 and abs(cmd_w) < 0.1:
+            return False
+            
+        now = rospy.Time.now()
+        if (now - self.last_stuck_check_time).to_sec() > self.stuck_check_interval:
+            is_stuck = False
+            if self.current_pose is not None and self.last_pose_position is not None:
+                # Calc distance moved
+                dx = self.current_pose.position.x - self.last_pose_position.x
+                dy = self.current_pose.position.y - self.last_pose_position.y
+                dist_moved = math.sqrt(dx*dx + dy*dy)
+                
+                if dist_moved < self.stuck_distance_threshold:
+                    is_stuck = True
+            
+            if self.current_pose is not None:
+                self.last_pose_position = self.current_pose.position
+                
+            self.last_stuck_check_time = now
+            return is_stuck
+        return False
 
     def preprocess_image(self, msg):
         try:
@@ -98,9 +143,12 @@ class NavigationNode:
     def preprocess_lidar(self, msg):
         if msg is None:
             return np.zeros((1, 360), dtype=np.float32)
+            
+        # 1. Handle Raw Data
         ranges = np.array(msg.ranges)
         ranges = np.nan_to_num(ranges, posinf=8.0, neginf=0.0)
-        ranges = np.clip(ranges, 0.0, 8.0)
+        
+        # 2. Resample to 360 points
         current_len = len(ranges)
         if current_len == 360:
             resampled = ranges
@@ -108,6 +156,17 @@ class NavigationNode:
             x_old = np.linspace(0, 1, current_len)
             x_new = np.linspace(0, 1, 360)
             resampled = np.interp(x_new, x_old, ranges)
+            
+        # 3. Clip (Match Training)
+        resampled = np.clip(resampled, 0.05, 8.0)
+        
+        # 4. Spike Filter (Match Training)
+        prev_lidar = np.roll(resampled, 1)
+        next_lidar = np.roll(resampled, -1)
+        spike_mask = (np.abs(resampled - prev_lidar) > 0.5) & (np.abs(resampled - next_lidar) > 0.5)
+        resampled[spike_mask] = (prev_lidar[spike_mask] + next_lidar[spike_mask]) / 2.0
+        
+        # 5. Normalize
         resampled = resampled.astype(np.float32) / 8.0
         return np.expand_dims(resampled, axis=0)
 
@@ -233,12 +292,28 @@ class NavigationNode:
                         risk_factor = max(0.0, (risk - 0.2) / (self.risk_threshold - 0.2))
                         risk_factor = min(risk_factor, 1.0)
                         
-                        fusion_weight = max(risk_factor, voa_intensity)
+                        # Define fusion_weight based on risk and VOA intensity
+                        # We prioritize risk, but also consider if VOA wants to turn sharply
+                        fusion_weight = max(risk_factor, voa_intensity * 0.3)
+                        fusion_weight = min(fusion_weight, 1.0)
                         
-                        # If VOA says "Go Straight" (intensity ~ 0) and Risk is low (0),
-                        # fusion_weight is 0 -> Pure Nav.
+                        if fusion_weight > 0.6:
+                            self.last_avoidance_time = rospy.Time.now()
                         
-                        # If VOA says "Turn Left" (intensity ~ 1), fusion_weight is 1 -> Pure VOA.
+                        # Anti-Oscillation Logic
+                        # If we recently avoided, suppress the Global Navigator's desire to turn back
+                        is_in_cooldown = (rospy.Time.now() - self.last_avoidance_time).to_sec() < self.avoidance_cooldown
+                        
+                        if is_in_cooldown:
+                            # We are in post-avoidance. Trust VOA or go straight.
+                            # Effectively, we mask out the 'nav_w' component if it contradicts or just in general
+                            # to be safe, we just reduce nav_w influence to 0.
+                            nav_w = 0.0
+                            fusion_weight = max(fusion_weight, 0.5) # Ensure VOA has at least 50% say, or just rely on 0 nav_w
+                            # Re-calculate with nav_w = 0
+                            # final_w = (1 - w) * 0 + w * voa_w = w * voa_w? 
+                            # If w is small (risk low), final_w -> 0 (Go Straight). This is GOOD.
+                            # We want to move AWAY/PAST the obstacle, not turn back.
                         
                         # Blend Angular Velocity
                         final_w = (1.0 - fusion_weight) * nav_w + fusion_weight * voa_w
@@ -253,6 +328,21 @@ class NavigationNode:
                             final_v = voa_v # Trust VOA speed (maybe it slows down)
                         else:
                             final_v = min(nav_v, voa_v) # Safe speed
+                        
+                        # Stuck Detection & Recovery Override
+                        if self.check_if_stuck(final_v, final_w):
+                            self.is_recovering = True
+                            self.recovery_start_time = rospy.Time.now()
+                            rospy.logwarn("Robot Stuck! Triggering Recovery...")
+                        
+                        if self.is_recovering:
+                            # Recovery: Reverse and Turn
+                            if (rospy.Time.now() - self.recovery_start_time).to_sec() < 1.5:
+                                final_v = -0.15
+                                final_w = 1.0 # Rotate in place
+                            else:
+                                self.is_recovering = False
+                                self.last_avoidance_time = rospy.Time.now() # Treat as avoidance to prevent immediate return
                             
                         twist.linear.x = float(final_v)
                         twist.angular.z = float(final_w)
