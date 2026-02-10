@@ -13,11 +13,20 @@ class VOAExportWrapper(nn.Module):
         outputs = self.voa_model(image, lidar, imu)
         return outputs['policy'], outputs['recovery']
 
-def export_model(model_class, checkpoint_path, output_path, is_dual_head=False):
+class ANNExportWrapper(nn.Module):
+    def __init__(self, ann_model):
+        super().__init__()
+        self.ann_model = ann_model
+
+    def forward(self, image, lidar, imu):
+        return torch.sigmoid(self.ann_model(image, lidar, imu))
+
+def export_model(model_class, checkpoint_path, output_path, is_dual_head=False, model_kwargs=None, wrap_single_head_sigmoid=False):
     print(f"Exporting {checkpoint_path} to {output_path}...")
     
     # 1. 初始化模型
-    model = model_class()
+    model_kwargs = model_kwargs or {}
+    model = model_class(**model_kwargs)
         
     # 2. 加载权重
     if os.path.exists(checkpoint_path):
@@ -34,6 +43,9 @@ def export_model(model_class, checkpoint_path, output_path, is_dual_head=False):
     model_to_export = model
     if is_dual_head:
         model_to_export = VOAExportWrapper(model)
+        model_to_export.eval()
+    elif wrap_single_head_sigmoid:
+        model_to_export = ANNExportWrapper(model)
         model_to_export.eval()
     
     # 3. 创建 Dummy Input
@@ -93,13 +105,20 @@ def export_model(model_class, checkpoint_path, output_path, is_dual_head=False):
 def main():
     save_dir = '../checkpoints'
     os.makedirs(save_dir, exist_ok=True)
+    ACTION_V_MAX = 0.3
+    ACTION_W_MAX = 1.5
     
     # 导出 VOA 模型 (双头)
     export_model(
-        VOAModel, 
+        VOAModel,
         os.path.join(save_dir, 'voa_best.pth'), 
         os.path.join(save_dir, 'voa_model.onnx'),
-        is_dual_head=True
+        is_dual_head=True,
+        model_kwargs={
+            'action_output_mode': 'tanh_scaled',
+            'action_v_max': ACTION_V_MAX,
+            'action_w_max': ACTION_W_MAX
+        }
     )
     
     # 导出 ANN 模型 (单头)
@@ -107,7 +126,8 @@ def main():
         CollisionModel, 
         os.path.join(save_dir, 'ann_best.pth'), 
         os.path.join(save_dir, 'ann_model.onnx'),
-        is_dual_head=False
+        is_dual_head=False,
+        wrap_single_head_sigmoid=True
     )
 
 if __name__ == '__main__':

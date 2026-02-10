@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--risk_resume", type=float, default=0.3)
     parser.add_argument("--hard_stop_dist", type=float, default=0.22)
     parser.add_argument("--recovery_frames", type=int, default=5)
+    parser.add_argument("--v_max", type=float, default=0.3)
+    parser.add_argument("--w_max", type=float, default=1.5)
     args = parser.parse_args()
 
     try:
@@ -95,6 +97,14 @@ def main():
         policy_v, policy_w = float(policy.reshape(-1)[0]), float(policy.reshape(-1)[1])
         rec = recovery.reshape(-1).tolist()
         v_s, w_s, v_m, w_m, v_l, w_l = [float(x) for x in rec[:6]]
+        policy_v = float(np.clip(policy_v, -args.v_max, args.v_max))
+        policy_w = float(np.clip(policy_w, -args.w_max, args.w_max))
+        v_s = float(np.clip(v_s, -args.v_max, args.v_max))
+        w_s = float(np.clip(w_s, -args.w_max, args.w_max))
+        v_m = float(np.clip(v_m, -args.v_max, args.v_max))
+        w_m = float(np.clip(w_m, -args.w_max, args.w_max))
+        v_l = float(np.clip(v_l, -args.v_max, args.v_max))
+        w_l = float(np.clip(w_l, -args.w_max, args.w_max))
 
         min_lidar = float(np.min(lidar))
         hard_stop = min_lidar < args.hard_stop_dist
@@ -129,4 +139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

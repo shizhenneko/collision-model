@@ -2,6 +2,18 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
+def _activation(name):
+    name = (name or 'silu').lower()
+    if name == 'silu':
+        return nn.SiLU(inplace=True)
+    if name == 'relu':
+        return nn.ReLU(inplace=True)
+    if name == 'hardswish':
+        return nn.Hardswish(inplace=True)
+    if name == 'identity' or name == 'none':
+        return nn.Identity()
+    raise ValueError(f"Unsupported activation: {name}")
+
 class ShuffleNetV2Ext(nn.Module):
     def __init__(self):
         super(ShuffleNetV2Ext, self).__init__()
@@ -36,7 +48,7 @@ class ShuffleNetV2Ext(nn.Module):
         return x
 
 class VisionEncoder(nn.Module):
-    def __init__(self, output_dim=256, freeze_shallow=True):
+    def __init__(self, output_dim=256, freeze_shallow=True, projector_hidden_dim=512, activation='silu', dropout=0.0):
         super(VisionEncoder, self).__init__()
         self.backbone = ShuffleNetV2Ext()
         
@@ -60,8 +72,11 @@ class VisionEncoder(nn.Module):
                 
         # 降维到 256
         self.projector = nn.Sequential(
-            nn.Linear(1024, output_dim),
-            nn.ReLU(inplace=True)
+            nn.Linear(1024, projector_hidden_dim),
+            nn.LayerNorm(projector_hidden_dim),
+            _activation(activation),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(projector_hidden_dim, output_dim)
         )
         
     def forward(self, x):
@@ -69,25 +84,26 @@ class VisionEncoder(nn.Module):
         return self.projector(feat)
 
 class LidarEncoder(nn.Module):
-    def __init__(self, output_dim=128):
+    def __init__(self, output_dim=128, activation='silu', dropout=0.0):
         super(LidarEncoder, self).__init__()
         # Input: [B, 1, 360]
         # Circular Padding 保持环形连续性
+        # 增加通道数以提取更丰富的特征 (16/32/64 -> 32/64/128)
         self.net = nn.Sequential(
             # Conv1
-            nn.Conv1d(1, 16, kernel_size=5, stride=2, padding=2, padding_mode='circular'),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
+            nn.Conv1d(1, 32, kernel_size=5, stride=2, padding=2, padding_mode='circular'),
+            nn.BatchNorm1d(32),
+            _activation(activation), 
             
             # Conv2
-            nn.Conv1d(16, 32, kernel_size=3, stride=2, padding=1, padding_mode='circular'),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-            
-            # Conv3
             nn.Conv1d(32, 64, kernel_size=3, stride=2, padding=1, padding_mode='circular'),
             nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
+            _activation(activation), 
+            
+            # Conv3
+            nn.Conv1d(64, 128, kernel_size=3, stride=2, padding=1, padding_mode='circular'),
+            nn.BatchNorm1d(128),
+            _activation(activation), 
             
             # Global Max Pooling
             nn.AdaptiveMaxPool1d(1),
@@ -95,8 +111,9 @@ class LidarEncoder(nn.Module):
         )
         
         self.fc = nn.Sequential(
-            nn.Linear(64, output_dim),
-            nn.ReLU(inplace=True)
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(128, output_dim)
+            # 移除 ReLU，允许输出负值
         )
 
     def forward(self, x):
@@ -107,13 +124,14 @@ class LidarEncoder(nn.Module):
         return self.fc(feat)
 
 class ImuEncoder(nn.Module):
-    def __init__(self, input_dim=9, output_dim=64):
+    def __init__(self, input_dim=9, output_dim=64, activation='silu', dropout=0.0):
         super(ImuEncoder, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, output_dim),
-            nn.ReLU(inplace=True)
+            _activation(activation),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(128, output_dim)
+            # 移除 ReLU，允许输出负值
         )
         
     def forward(self, x):
@@ -121,16 +139,16 @@ class ImuEncoder(nn.Module):
         return self.net(x)
 
 class GatedFusion(nn.Module):
-    def __init__(self, vis_dim=256, lidar_dim=128, imu_dim=64):
+    def __init__(self, vis_dim=256, lidar_dim=128, imu_dim=64, gate_mode='softmax'):
         super(GatedFusion, self).__init__()
         self.total_dim = vis_dim + lidar_dim + imu_dim
+        self.gate_mode = gate_mode
         
         # 门控网络：根据拼接后的特征计算每个模态的权重
         self.gate_net = nn.Sequential(
             nn.Linear(self.total_dim, 64),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 3), # 3个模态的权重
-            nn.Sigmoid()
+            nn.Linear(64, 3) # 3个模态的权重
         )
         
         self.vis_dim = vis_dim
@@ -142,7 +160,13 @@ class GatedFusion(nn.Module):
         concat_feat = torch.cat([vis, lidar, imu], dim=1)
         
         # 计算权重 [B, 3]
-        weights = self.gate_net(concat_feat)
+        gate_logits = self.gate_net(concat_feat)
+        if self.gate_mode == 'softmax':
+            weights = torch.softmax(gate_logits, dim=1)
+        elif self.gate_mode == 'sigmoid':
+            weights = torch.sigmoid(gate_logits)
+        else:
+            raise ValueError(f"Unsupported gate_mode: {self.gate_mode}")
         
         # 加权
         w_vis = weights[:, 0:1]
@@ -157,20 +181,26 @@ class GatedFusion(nn.Module):
         return torch.cat([fused_vis, fused_lidar, fused_imu], dim=1)
 
 class CollisionModel(nn.Module):
-    def __init__(self):
+    def __init__(self, activation='silu', dropout=0.5):
         super(CollisionModel, self).__init__()
-        self.vis_encoder = VisionEncoder()
-        self.lidar_encoder = LidarEncoder()
-        self.imu_encoder = ImuEncoder()
+        self.vis_encoder = VisionEncoder(activation=activation, dropout=dropout/2)
+        self.lidar_encoder = LidarEncoder(activation=activation, dropout=dropout/2)
+        self.imu_encoder = ImuEncoder(activation=activation, dropout=dropout/2)
         
-        self.fusion = GatedFusion()
+        self.fusion = GatedFusion(gate_mode='softmax')
         
         # 碰撞预测头
+        # 增加深度，缓解降维过快 (448 -> 256 -> 64 -> 1)
         self.head = nn.Sequential(
-            nn.Linear(448, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
+            nn.Linear(448, 256),
+            _activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            _activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            _activation(activation),
+            nn.Linear(64, 1)
         )
         
     def forward(self, image, lidar, imu):
@@ -179,31 +209,41 @@ class CollisionModel(nn.Module):
         i = self.imu_encoder(imu)
         
         fused = self.fusion(v, l, i)
-        prob = self.head(fused)
-        return prob
+        return self.head(fused)
 
 class VOAModel(nn.Module):
-    def __init__(self):
+    def __init__(self, action_output_mode='raw', action_v_max=0.3, action_w_max=1.5, activation='silu', dropout=0.5):
         super(VOAModel, self).__init__()
-        self.vis_encoder = VisionEncoder(freeze_shallow=True)
-        self.lidar_encoder = LidarEncoder()
-        self.imu_encoder = ImuEncoder()
+        self.vis_encoder = VisionEncoder(freeze_shallow=True, activation=activation, dropout=dropout/2)
+        self.lidar_encoder = LidarEncoder(activation=activation, dropout=dropout/2)
+        self.imu_encoder = ImuEncoder(activation=activation, dropout=dropout/2)
         
-        self.fusion = GatedFusion()
+        self.fusion = GatedFusion(gate_mode='softmax')
+        self.action_output_mode = action_output_mode
+        self.action_v_max = float(action_v_max)
+        self.action_w_max = float(action_w_max)
         
         # 1. Policy Head (用于正常行驶)
         # Output: [v, w]
         self.policy_head = nn.Sequential(
-            nn.Linear(448, 128),
-            nn.ReLU(inplace=True),
+            nn.Linear(448, 256),
+            _activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            _activation(activation),
+            nn.Dropout(dropout),
             nn.Linear(128, 2)
         )
         
         # 2. Recovery Head (用于 ANN 触发后的动作续接)
         # Output: [v_s, w_s, v_m, w_m, v_l, w_l] (6 dim)
         self.recovery_head = nn.Sequential(
-            nn.Linear(448, 128),
-            nn.ReLU(inplace=True),
+            nn.Linear(448, 256),
+            _activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            _activation(activation),
+            nn.Dropout(dropout),
             nn.Linear(128, 6)
         )
         
@@ -216,6 +256,18 @@ class VOAModel(nn.Module):
         
         policy_out = self.policy_head(fused)
         recovery_out = self.recovery_head(fused)
+
+        if self.action_output_mode != 'raw':
+            if self.action_output_mode == 'tanh_norm':
+                policy_out = torch.tanh(policy_out)
+                recovery_out = torch.tanh(recovery_out)
+            elif self.action_output_mode == 'tanh_scaled':
+                policy_scale = policy_out.new_tensor([self.action_v_max, self.action_w_max]).view(1, 2)
+                recovery_scale = recovery_out.new_tensor([self.action_v_max, self.action_w_max] * 3).view(1, 6)
+                policy_out = torch.tanh(policy_out) * policy_scale
+                recovery_out = torch.tanh(recovery_out) * recovery_scale
+            else:
+                raise ValueError(f"Unsupported action_output_mode: {self.action_output_mode}")
         
         # 返回字典，方便 loss 计算
         return {

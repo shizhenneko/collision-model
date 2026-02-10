@@ -11,11 +11,14 @@ def main():
     # ================= 配置参数 (Configuration) =================
     data_roots = [
         '../data_ready',
-        '../data_ready_1'
+        '../data_ready_1',
     ]
+    ACTION_NORM = True
+    ACTION_V_MAX = 0.3
+    ACTION_W_MAX = 1.5
     
-    batch_size = 32
-    num_epochs = 30
+    batch_size = 64
+    num_epochs = 25
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -38,7 +41,12 @@ def main():
         if os.path.exists(full_path):
             print(f"Found dataset at: {full_path}")
             try:
-                ds = CollisionDataset(full_path)
+                ds = CollisionDataset(
+                    full_path,
+                    normalize_action=ACTION_NORM,
+                    v_max=ACTION_V_MAX,
+                    w_max=ACTION_W_MAX
+                )
                 datasets.append(ds)
             except Exception as e:
                 print(f"Error loading {full_path}: {e}")
@@ -57,7 +65,11 @@ def main():
     
     # ================= 模型构建 (Model Building) =================
     # 双头 VOA 模型
-    model = VOAModel().to(device)
+    model = VOAModel(
+        action_output_mode='tanh_norm' if ACTION_NORM else 'raw',
+        action_v_max=ACTION_V_MAX,
+        action_w_max=ACTION_W_MAX
+    ).to(device)
     
     # 加载 ANN 模型作为 Reward Function (强制)
     if not os.path.exists(ANN_CHECKPOINT):
@@ -126,7 +138,7 @@ def main():
             
             # 2. RWR Weight Calculation
             with torch.no_grad():
-                risk_scores = ann_model(images, lidars, imus) # [B, 1]
+                risk_scores = torch.sigmoid(ann_model(images, lidars, imus)) # [B, 1]
                 # Reward: 越安全(risk越低)奖励越高
                 rewards = 1.0 - risk_scores
                 # Weight: exp(R / T)

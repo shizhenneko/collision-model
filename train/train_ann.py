@@ -2,10 +2,27 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, Dataset
 from dataset import CollisionDataset, split_dataset_train_val_test
 from models import CollisionModel
+import torchvision.transforms as T
 import time
+
+class TransformedDataset(Dataset):
+    def __init__(self, dataset, transform=None):
+        self.dataset = dataset
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.dataset)
+        
+    def __getitem__(self, idx):
+        # 注意：这里需要浅拷贝，避免修改原 dataset 的缓存（如果有的话）
+        # 但 CollisionDataset 每次 __getitem__ 都是重新读取，所以安全
+        sample = self.dataset[idx]
+        if self.transform:
+            sample['image'] = self.transform(sample['image'])
+        return sample
 
 def evaluate_binary(model, loader, device, criterion, threshold=0.5):
     model.eval()
@@ -20,8 +37,9 @@ def evaluate_binary(model, loader, device, criterion, threshold=0.5):
             imus = batch['imu'].to(device)
             labels = batch['collision'].to(device)
 
-            outputs = model(images, lidars, imus)
-            loss = criterion(outputs, labels)
+            logits = model(images, lidars, imus)
+            loss = criterion(logits, labels)
+            outputs = torch.sigmoid(logits)
 
             batch_size = images.size(0)
             total_loss += loss.item() * batch_size
@@ -59,12 +77,11 @@ def main():
     data_roots = [
         '../data_ready',
         '../data_ready_1',
-        '../data_ready_2'
     ]
     
-    batch_size = 32
+    batch_size = 64
     learning_rate = 1e-4
-    num_epochs = 20
+    num_epochs = 25
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -90,18 +107,28 @@ def main():
     # 合并数据集
     full_dataset = ConcatDataset(datasets)
     
-    train_set, val_set, test_set = split_dataset_train_val_test(full_dataset, val_ratio=0.15, test_ratio=0.15)
+    train_set, val_set, test_set = split_dataset_train_val_test(full_dataset, val_ratio=0.15, test_ratio=0.15, min_train_samples=1000)
+    
+    # 数据增强 (Data Augmentation)
+    # 增加图像变换以防止过拟合
+    train_transform = T.Compose([
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        T.RandomErasing(p=0.2, scale=(0.02, 0.15)),
+    ])
+    train_set = TransformedDataset(train_set, transform=train_transform)
     
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     # ================= 模型构建 (Model Building) =================
-    model = CollisionModel().to(device)
+    # 启用 Dropout (0.5) 防止过拟合
+    model = CollisionModel(dropout=0.5).to(device)
     
     # ================= 优化器与损失函数 (Optimizer & Loss) =================
-    criterion = nn.BCELoss() # 二分类交叉熵损失
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.BCEWithLogitsLoss()
+    # 增加 weight_decay (L2 正则化)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     
     # ================= 训练循环 (Training Loop) =================
     best_val_loss = float('inf')
@@ -128,10 +155,10 @@ def main():
             optimizer.zero_grad()
             
             # 前向传播
-            outputs = model(images, lidars, imus) # [B, 1]
+            logits = model(images, lidars, imus) # [B, 1]
             
             # 计算损失
-            loss = criterion(outputs, labels)
+            loss = criterion(logits, labels)
             
             # 反向传播
             loss.backward()
@@ -140,6 +167,7 @@ def main():
             train_loss += loss.item() * images.size(0)
             
             # 计算准确率 (阈值 0.5)
+            outputs = torch.sigmoid(logits)
             preds = (outputs > 0.5).float()
             train_acc += (preds == labels).sum().item()
             
