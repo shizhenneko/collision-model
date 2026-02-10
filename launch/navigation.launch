@@ -2,12 +2,12 @@
   <!-- Navigation Node (VOA Integrated) -->
   <node pkg="collision_model" type="navigation_node.py" name="navigation_node" output="screen">
     <!-- Remap topics to match your robot's configuration -->
-    <remap from="/camera/image_raw" to="/camera/rgb/image_raw"/>
+   <!--<remap from="/camera/image_raw" to="/camera/rgb/image_raw"/>
     <remap from="/scan" to="/scan"/>
     <remap from="/imu/data" to="/imu/data"/>
     <remap from="/cmd_vel" to="/cmd_vel"/>
     <remap from="/odom" to="/odom"/>
-    <remap from="/move_base_simple/goal" to="/move_base_simple/goal"/>
+    <remap from="/move_base_simple/goal" to="/move_base_simple/goal"/>-->
 
     <!-- Parameters -->
     <!-- Use absolute paths or $(find collision_model) if package is installed -->

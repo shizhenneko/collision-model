@@ -32,13 +32,9 @@ def send_goal(x, y, theta):
     rospy.loginfo("Goal sent!")
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: send_goal.py <x> <y> [theta]")
-        sys.exit(1)
-        
-    x = float(sys.argv[1])
-    y = float(sys.argv[2])
-    theta = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+    x = 3.0
+    y = 0.0
+    theta = 0.0
     
     try:
         send_goal(x, y, theta)

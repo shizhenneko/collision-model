@@ -35,7 +35,10 @@ class InferenceNode:
         self.risk_threshold = rospy.get_param('~risk_threshold', 0.7)
         self.brake_duration_short = 0.3 # seconds
         
-        # Load ONNX Models
+        # Recovery Parameters
+        self.recovery_cooldown = 4.0 # Increased from 2.0s to ensure robot clears the obstacle
+        self.reward_growth_rate = 0.4 # Increased from 0.1 (implicit) to 0.4 for faster speed reward
+
         rospy.loginfo(f"Loading ANN model from {self.ann_path}...")
         self.sess_ann = ort.InferenceSession(self.ann_path, providers=['CPUExecutionProvider'])
         
@@ -51,15 +54,17 @@ class InferenceNode:
         
         # State Machine
         self.is_braking = False
-        self.brake_start_time = None
+        self.stuck_start_time = None # Replaces brake_start_time to track "episode"
+        self.last_risk_time = rospy.Time(0)
+        # self.recovery_cooldown is now defined above
         
         # Publishers
         self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
         
         # Subscribers
-        rospy.Subscriber('/camera/image_raw', Image, self.image_callback, queue_size=1, buff_size=2**24)
+        rospy.Subscriber('/usb_cam/image_raw', Image, self.image_callback, queue_size=1, buff_size=2**24)
         rospy.Subscriber('/scan', LaserScan, self.scan_callback, queue_size=1)
-        rospy.Subscriber('/imu/data', Imu, self.imu_callback, queue_size=1)
+        rospy.Subscriber('/imu', Imu, self.imu_callback, queue_size=1)
         
         rospy.loginfo("Inference Node Ready!")
 
@@ -98,7 +103,8 @@ class InferenceNode:
 
     def preprocess_lidar(self, msg):
         if msg is None:
-            return np.zeros((1, 360), dtype=np.float32)
+            # Return max range (safe) instead of zeros (collision)
+            return np.full((1, 360), 8.0, dtype=np.float32)
             
         # 1. Handle Raw Data
         ranges = np.array(msg.ranges)
@@ -193,18 +199,31 @@ class InferenceNode:
             rospy.logwarn_throttle(1, f"COLLISION RISK DETECTED: {risk:.2f} > {self.risk_threshold}. EMERGENCY BRAKE!")
             # Emergency Brake
             self.is_braking = True
-            if self.brake_start_time is None:
-                self.brake_start_time = rospy.Time.now()
+            self.last_risk_time = rospy.Time.now()
+            
+            # Start tracking the "Stuck Episode" if not already started
+            if self.stuck_start_time is None:
+                self.stuck_start_time = rospy.Time.now()
             
             twist.linear.x = 0.0
             twist.angular.z = 0.0
             
         else:
-            # Safe
-            if self.is_braking:
+            # Check if we are in a "Recovery Episode" (Recent Risk or currently Braking)
+            time_since_risk = (rospy.Time.now() - self.last_risk_time).to_sec()
+            
+            # Condition to enter/continue recovery:
+            # 1. We were just braking (is_braking=True)
+            # 2. OR we are within cooldown period (prevent oscillation resetting timer)
+            is_recovering = self.is_braking or (time_since_risk < self.recovery_cooldown and self.stuck_start_time is not None)
+            
+            if is_recovering:
                 # Recovery Mode
-                brake_duration = (rospy.Time.now() - self.brake_start_time).to_sec()
-                rospy.loginfo(f"Recovering from brake. Duration: {brake_duration:.2f}s")
+                if self.stuck_start_time is None:
+                     self.stuck_start_time = rospy.Time.now() # Should be set, but safety check
+                     
+                stuck_duration = (rospy.Time.now() - self.stuck_start_time).to_sec()
+                rospy.loginfo_throttle(0.5, f"Recovering... Stuck Duration: {stuck_duration:.2f}s")
                 
                 # Run VOA
                 voa_inputs = {
@@ -219,34 +238,63 @@ class InferenceNode:
                     
                     recovery_out = outputs[1][0]
                     
-                    if brake_duration < self.brake_duration_short:
-                        # Use Medium-term (Index 2, 3) per document?
-                        # Document: "delta < 0.3s: Use Medium"
-                        v = recovery_out[2]
-                        w = recovery_out[3]
-                        rospy.loginfo("Strategy: Medium-Term Recovery")
+                    # Candidate Strategies
+                    v_med, w_med = float(recovery_out[2]), float(recovery_out[3])
+                    v_long, w_long = float(recovery_out[4]), float(recovery_out[5])
+
+                    # Selection Strategy with Time-Increasing Reward
+                    # User Request: Reward execution (speed), reward grows with time
+                    max_speed = 0.3
+                    target_speed = self.reward_growth_rate * max_speed # Increased baseline for reward
+                    
+                    # Reward term increases with time
+                    reward = stuck_duration * target_speed 
+                    
+                    # Calculate Scores: Base preference is velocity (execution)
+                    # FIX: Include angular velocity in score to prevent getting stuck when turning in place
+                    w_weight = 0.1 # Weight for angular velocity contribution
+                    score_med = abs(v_med) + w_weight * abs(w_med)
+                    score_long = abs(v_long) + w_weight * abs(w_long)
+                    
+                    # Add reward if the strategy actually executes movement (above threshold)
+                    # FIX: Also check angular velocity threshold
+                    target_turn_speed = 0.3 # rad/s
+                    
+                    is_active_med = abs(v_med) > target_speed or abs(w_med) > target_turn_speed
+                    is_active_long = abs(v_long) > target_speed or abs(w_long) > target_turn_speed
+
+                    if is_active_med:
+                        score_med += reward
+                        
+                    if is_active_long:
+                        score_long += reward
+                        
+                    # Select Strategy
+                    if score_med >= score_long:
+                        v, w = v_med, w_med
+                        strategy_name = "Medium"
                     else:
-                        # Use Long-term (Index 4, 5) per document?
-                        # Document: "delta >= 0.3s: Use Long"
-                        v = recovery_out[4]
-                        w = recovery_out[5]
-                        rospy.loginfo("Strategy: Long-Term Recovery")
+                        v, w = v_long, w_long
+                        strategy_name = "Long"
+                        
+                    rospy.loginfo_throttle(0.5, f"Recovering ({strategy_name}): Time={stuck_duration:.2f}s, Scores=[M:{score_med:.3f}, L:{score_long:.3f}]")
                     
-                    twist.linear.x = float(v)
-                    twist.angular.z = float(w)
+                    twist.linear.x = v
+                    twist.angular.z = w
                     
-                    # Reset Brake State (Single-shot recovery, or transition out)
-                    # If we continually detect risk < threshold, we should eventually go back to normal.
-                    # Here we transition to normal state immediately for next frame?
-                    # Or keep 'is_braking' until some condition?
-                    # For simplicity: One frame of recovery action, then reset.
+                    # Reset Brake Flag (but NOT stuck_start_time yet)
                     self.is_braking = False
-                    self.brake_start_time = None
+                    
                 except Exception as e:
                     rospy.logerr(f"VOA Recovery Inference failed: {e}")
 
             else:
-                # Normal Driving
+                # Normal Driving (Risk Low AND Cooldown Passed)
+                # Reset Stuck Timer
+                if self.stuck_start_time is not None:
+                    rospy.loginfo("Recovery Complete. Resuming Normal Driving.")
+                    self.stuck_start_time = None
+                    
                 voa_inputs = {
                     'image': img_input,
                     'lidar': lidar_input,
