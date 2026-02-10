@@ -83,6 +83,14 @@ class VisionEncoder(nn.Module):
         feat = self.backbone(x)
         return self.projector(feat)
 
+class GlobalMaxPool1d(nn.Module):
+    def __init__(self):
+        super(GlobalMaxPool1d, self).__init__()
+
+    def forward(self, x):
+        # x: [B, C, L] -> [B, C, 1]
+        return torch.max(x, dim=-1, keepdim=True)[0]
+
 class LidarEncoder(nn.Module):
     def __init__(self, output_dim=128, activation='silu', dropout=0.0):
         super(LidarEncoder, self).__init__()
@@ -106,7 +114,7 @@ class LidarEncoder(nn.Module):
             _activation(activation), 
             
             # Global Max Pooling
-            nn.AdaptiveMaxPool1d(1),
+            GlobalMaxPool1d(),
             nn.Flatten()
         )
         
